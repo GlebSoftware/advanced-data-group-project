@@ -2,6 +2,7 @@
 ISS_POSITION_URL = "https://api.wheretheiss.at/v1/satellites/25544"
 NASA_SSC_BASE_URL = "https://sscweb.gsfc.nasa.gov/WS/sscr/2"
 SATNOGS_STATIONS_URL = "https://network.satnogs.org/api/stations/"
+CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
 
 # NASA spacecraft to track via the SSC API (ID, display name, color)
 NASA_SPACECRAFT = [

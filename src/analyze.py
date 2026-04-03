@@ -166,6 +166,73 @@ def predict_upcoming_passes(
     )
 
 
+def predict_passes_over_location(
+    user_lat: float,
+    user_lon: float,
+    spacecraft_data: dict,
+    threshold_km: float = PROXIMITY_THRESHOLD_KM,
+) -> pd.DataFrame:
+    """Predict which spacecraft will pass over a user's location.
+
+    Projects each spacecraft's trajectory forward and checks if it
+    comes within threshold_km of the user's coordinates.
+    Returns a DataFrame of upcoming passes sorted by time.
+    """
+    passes = []
+
+    for sc_name, positions in spacecraft_data.items():
+        if not positions or len(positions) < 2:
+            continue
+
+        # Use the two most recent positions for projection
+        p1, p2 = positions[-2], positions[-1]
+        dt = p2["timestamp"] - p1["timestamp"]
+        if dt == 0:
+            continue
+
+        lat_rate = (p2["latitude"] - p1["latitude"]) / dt
+        lon_rate = (p2["longitude"] - p1["longitude"]) / dt
+
+        # Project forward in 60-second steps for 90 minutes
+        for step in range(1, 91):
+            future_s = step * 60
+            proj_lat = max(
+                -90, min(90, p2["latitude"] + lat_rate * future_s)
+            )
+            proj_lon = (
+                (p2["longitude"] + lon_rate * future_s + 180) % 360
+            ) - 180
+            proj_time = p2["timestamp"] + future_s
+
+            dist = haversine(
+                (proj_lat, proj_lon),
+                (user_lat, user_lon),
+                unit=Unit.KILOMETERS,
+            )
+            if dist <= threshold_km:
+                passes.append({
+                    "spacecraft": sc_name,
+                    "estimated_distance_km": round(dist, 1),
+                    "projected_time_utc": datetime.fromtimestamp(
+                        proj_time, tz=timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC"),
+                    "minutes_from_now": step,
+                })
+
+    if not passes:
+        return pd.DataFrame(columns=[
+            "spacecraft", "estimated_distance_km",
+            "projected_time_utc", "minutes_from_now",
+        ])
+
+    return (
+        pd.DataFrame(passes)
+        .sort_values("minutes_from_now")
+        .drop_duplicates(subset=["spacecraft"], keep="first")
+        .reset_index(drop=True)
+    )
+
+
 def generate_interference_summary(
     nearby_df: pd.DataFrame,
     passes_df: pd.DataFrame,

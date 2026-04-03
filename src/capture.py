@@ -17,6 +17,7 @@ from src.config import (
     ISS_POSITION_URL,
     NASA_SSC_BASE_URL,
     SATNOGS_STATIONS_URL,
+    CENSUS_GEOCODER_URL,
     STATION_STATUS_ACTIVE,
     EARTH_RADIUS_KM,
     NASA_SPACECRAFT,
@@ -199,4 +200,39 @@ def fetch_ground_stations() -> Optional[pd.DataFrame]:
         return df.reset_index(drop=True)
 
     except (requests.RequestException, KeyError, ValueError):
+        return None
+
+
+def geocode_address(address: str) -> Optional[dict]:
+    """Geocode an address using the US Census Bureau Geocoder API.
+
+    Returns a dict with latitude, longitude, and the matched address
+    string. Returns None if the address cannot be resolved.
+    """
+    try:
+        response = requests.get(
+            CENSUS_GEOCODER_URL,
+            params={
+                "address": address,
+                "benchmark": "Public_AR_Current",
+                "format": "json",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        matches = data["result"]["addressMatches"]
+        if not matches:
+            return None
+
+        match = matches[0]
+        coords = match["coordinates"]
+        return {
+            "latitude": coords["y"],
+            "longitude": coords["x"],
+            "matched_address": match["matchedAddress"],
+        }
+
+    except (requests.RequestException, KeyError, IndexError):
         return None

@@ -14,10 +14,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.capture import fetch_all_spacecraft, fetch_ground_stations
+from src.capture import (
+    fetch_all_spacecraft,
+    fetch_ground_stations,
+    geocode_address,
+)
 from src.process import build_trajectory_dataframe, process_position
 from src.analyze import (
     find_all_spacecraft_nearby,
+    predict_passes_over_location,
     generate_interference_summary,
     predict_upcoming_passes,
 )
@@ -480,6 +485,70 @@ def main() -> None:
     with col2:
         render_passes_table(passes_df)
 
+    # -- What's Passing Over Me? --
+    st.markdown("---")
+    st.subheader("What's Passing Over Me?")
+    st.caption(
+        "Enter a US address to see which spacecraft will pass "
+        "near your location in the next 90 minutes."
+    )
+
+    address_input = st.text_input(
+        "Enter your address",
+        placeholder="e.g. 1600 Pennsylvania Ave, Washington, DC",
+        key="user_address",
+    )
+
+    if address_input:
+        with st.spinner("Geocoding address..."):
+            location = geocode_address(address_input)
+
+        if location is None:
+            st.error(
+                "Could not find that address. Please try a valid "
+                "US street address (e.g. 123 Main St, Houston, TX)."
+            )
+        else:
+            st.success(
+                f"Matched: **{location['matched_address']}** "
+                f"({location['latitude']:.4f}, "
+                f"{location['longitude']:.4f})"
+            )
+
+            user_passes = predict_passes_over_location(
+                location["latitude"],
+                location["longitude"],
+                spacecraft_data,
+                threshold_km=threshold,
+            )
+
+            if user_passes.empty:
+                st.info(
+                    "No spacecraft predicted to pass within "
+                    f"{threshold} km of your location in the "
+                    "next 90 minutes. Try increasing the "
+                    "proximity threshold in the sidebar."
+                )
+            else:
+                st.dataframe(
+                    user_passes,
+                    column_config={
+                        "spacecraft": "Spacecraft",
+                        "estimated_distance_km":
+                            st.column_config.NumberColumn(
+                                "Closest Approach (km)",
+                                format="%.1f",
+                            ),
+                        "projected_time_utc": "Estimated Time (UTC)",
+                        "minutes_from_now":
+                            st.column_config.NumberColumn(
+                                "Minutes From Now",
+                            ),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
     # Charts
     col3, col4 = st.columns(2)
     with col3:
@@ -512,7 +581,8 @@ def main() -> None:
    spacecraft and every ground station. Stations within the
    proximity threshold flagged with CRITICAL/WARNING/WATCH
    severity. Trajectory projection predicts upcoming passes
-   over the next 90 minutes.
+   over the next 90 minutes. User addresses geocoded via the
+   US Census Bureau Geocoder API for personal pass predictions.
 
 5. **Communicate** -- This interactive Streamlit dashboard with
    a 3D globe, proximity alerts, pass predictions, and
@@ -525,6 +595,8 @@ def main() -> None:
   -- orbital data for NASA spacecraft (no API key required)
 - [SatNOGS Network API](https://network.satnogs.org/api/)
   -- global ground station locations (no API key required)
+- [US Census Bureau Geocoder](https://geocoding.geo.census.gov/)
+  -- address-to-coordinate conversion (no API key required)
 
 **Authors:** Gleb Alikhver, Lucy Moon, Lexie-Anne Rodkey -- MIST6380
             """
