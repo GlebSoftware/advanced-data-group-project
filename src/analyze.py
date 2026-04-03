@@ -18,10 +18,9 @@ def compute_station_distances(
     spacecraft_lon: float,
     stations_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Calculate distance from spacecraft to every ground station.
+    """Calculate distance from a spacecraft to every ground station.
 
-    Adds a 'distance_km' column to a copy of the stations DataFrame
-    and sorts by distance ascending.
+    Adds a 'distance_km' column and sorts by distance ascending.
     """
     df = stations_df.copy()
     df["distance_km"] = df.apply(
@@ -41,19 +40,50 @@ def find_nearby_stations(
     stations_df: pd.DataFrame,
     threshold_km: float = PROXIMITY_THRESHOLD_KM,
 ) -> pd.DataFrame:
-    """Identify ground stations within the proximity threshold.
-
-    Returns a DataFrame of stations that are within threshold_km
-    of the spacecraft, flagged as potential interference risks.
-    """
-    df_with_dist = compute_station_distances(
+    """Identify ground stations within the proximity threshold."""
+    df = compute_station_distances(
         spacecraft_lat, spacecraft_lon, stations_df
     )
-    nearby = df_with_dist[df_with_dist["distance_km"] <= threshold_km].copy()
+    nearby = df[df["distance_km"] <= threshold_km].copy()
     nearby["alert_level"] = nearby["distance_km"].apply(
         _classify_alert_level
     )
     return nearby
+
+
+def find_all_spacecraft_nearby(
+    spacecraft_positions: dict,
+    stations_df: pd.DataFrame,
+    threshold_km: float = PROXIMITY_THRESHOLD_KM,
+) -> pd.DataFrame:
+    """Find nearby stations for ALL spacecraft at once.
+
+    Returns a combined DataFrame with a 'spacecraft' column indicating
+    which spacecraft triggered the proximity alert.
+    """
+    all_nearby = []
+
+    for sc_name, positions in spacecraft_positions.items():
+        if not positions:
+            continue
+        latest = positions[-1]
+        nearby = find_nearby_stations(
+            latest["latitude"],
+            latest["longitude"],
+            stations_df,
+            threshold_km,
+        )
+        if not nearby.empty:
+            nearby = nearby.copy()
+            nearby["spacecraft"] = sc_name
+            all_nearby.append(nearby)
+
+    if not all_nearby:
+        return pd.DataFrame()
+
+    return pd.concat(all_nearby, ignore_index=True).sort_values(
+        "distance_km"
+    )
 
 
 def _classify_alert_level(distance_km: float) -> str:
@@ -62,136 +92,99 @@ def _classify_alert_level(distance_km: float) -> str:
         return "CRITICAL"
     elif distance_km <= 250:
         return "WARNING"
-    else:
-        return "WATCH"
+    return "WATCH"
 
 
 def predict_upcoming_passes(
     trajectory_df: pd.DataFrame,
     stations_df: pd.DataFrame,
+    spacecraft_name: str = "ISS",
     threshold_km: float = PROXIMITY_THRESHOLD_KM,
 ) -> pd.DataFrame:
-    """Predict which ground stations the ISS will pass near.
+    """Predict which ground stations a spacecraft will pass near.
 
-    Uses the recent trajectory to estimate the spacecraft's heading
-    and projects forward to identify upcoming proximity events.
-    Returns a DataFrame of predicted passes with estimated times.
+    Uses the two most recent positions to estimate heading and
+    projects forward in 60-second increments for 90 minutes.
     """
-    if trajectory_df.empty or len(trajectory_df) < 2:
-        return pd.DataFrame(
-            columns=[
-                "station_name",
-                "station_lat",
-                "station_lon",
-                "estimated_distance_km",
-                "projected_time_utc",
-                "alert_level",
-            ]
-        )
+    empty = pd.DataFrame(columns=[
+        "spacecraft", "station_name", "station_lat", "station_lon",
+        "estimated_distance_km", "projected_time_utc", "alert_level",
+    ])
 
-    # Use the two most recent positions to estimate velocity vector
+    if trajectory_df.empty or len(trajectory_df) < 2:
+        return empty
+
     recent = trajectory_df.tail(2)
-    lat1, lon1, t1 = (
-        recent.iloc[0]["latitude"],
-        recent.iloc[0]["longitude"],
-        recent.iloc[0]["timestamp"],
-    )
-    lat2, lon2, t2 = (
-        recent.iloc[1]["latitude"],
-        recent.iloc[1]["longitude"],
-        recent.iloc[1]["timestamp"],
-    )
+    lat1 = recent.iloc[0]["latitude"]
+    lon1 = recent.iloc[0]["longitude"]
+    t1 = recent.iloc[0]["timestamp"]
+    lat2 = recent.iloc[1]["latitude"]
+    lon2 = recent.iloc[1]["longitude"]
+    t2 = recent.iloc[1]["timestamp"]
 
     dt = t2 - t1
     if dt == 0:
-        return pd.DataFrame(
-            columns=[
-                "station_name",
-                "station_lat",
-                "station_lon",
-                "estimated_distance_km",
-                "projected_time_utc",
-                "alert_level",
-            ]
-        )
+        return empty
 
-    # Rate of change in degrees per second
     lat_rate = (lat2 - lat1) / dt
     lon_rate = (lon2 - lon1) / dt
 
-    # Project forward in 60-second increments for the next 90 minutes
-    # (roughly one ISS orbit)
     passes = []
     for step in range(1, 91):
         future_seconds = step * 60
-        projected_lat = lat2 + lat_rate * future_seconds
-        projected_lon = lon2 + lon_rate * future_seconds
-
-        # Clamp latitude to valid range
-        projected_lat = max(-90, min(90, projected_lat))
-
-        # Wrap longitude to [-180, 180]
-        projected_lon = ((projected_lon + 180) % 360) - 180
-
-        projected_time = t2 + future_seconds
+        proj_lat = max(-90, min(90, lat2 + lat_rate * future_seconds))
+        proj_lon = ((lon2 + lon_rate * future_seconds + 180) % 360) - 180
+        proj_time = t2 + future_seconds
 
         for _, station in stations_df.iterrows():
             dist = haversine(
-                (projected_lat, projected_lon),
+                (proj_lat, proj_lon),
                 (station["latitude"], station["longitude"]),
                 unit=Unit.KILOMETERS,
             )
             if dist <= threshold_km:
-                passes.append(
-                    {
-                        "station_name": station["name"],
-                        "station_lat": station["latitude"],
-                        "station_lon": station["longitude"],
-                        "estimated_distance_km": round(dist, 1),
-                        "projected_time_utc": datetime.fromtimestamp(
-                            projected_time, tz=timezone.utc
-                        ).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                        "alert_level": _classify_alert_level(dist),
-                    }
-                )
+                passes.append({
+                    "spacecraft": spacecraft_name,
+                    "station_name": station["name"],
+                    "station_lat": station["latitude"],
+                    "station_lon": station["longitude"],
+                    "estimated_distance_km": round(dist, 1),
+                    "projected_time_utc": datetime.fromtimestamp(
+                        proj_time, tz=timezone.utc
+                    ).strftime("%H:%M:%S UTC"),
+                    "alert_level": _classify_alert_level(dist),
+                })
 
-    passes_df = pd.DataFrame(passes)
-    if not passes_df.empty:
-        passes_df = (
-            passes_df.sort_values("estimated_distance_km")
-            .drop_duplicates(subset=["station_name"], keep="first")
-            .reset_index(drop=True)
-        )
-    return passes_df
+    if not passes:
+        return empty
+
+    return (
+        pd.DataFrame(passes)
+        .sort_values("estimated_distance_km")
+        .drop_duplicates(subset=["spacecraft", "station_name"], keep="first")
+        .reset_index(drop=True)
+    )
 
 
 def generate_interference_summary(
-    nearby_stations: pd.DataFrame,
-    predicted_passes: pd.DataFrame,
+    nearby_df: pd.DataFrame,
+    passes_df: pd.DataFrame,
 ) -> dict:
-    """Produce a summary of current and predicted interference risks.
-
-    Returns a dict with counts and details for dashboard display.
-    """
+    """Produce a summary of current and predicted interference risks."""
     return {
-        "current_nearby_count": len(nearby_stations),
-        "critical_count": len(
-            nearby_stations[nearby_stations["alert_level"] == "CRITICAL"]
-        )
-        if not nearby_stations.empty
-        else 0,
-        "warning_count": len(
-            nearby_stations[nearby_stations["alert_level"] == "WARNING"]
-        )
-        if not nearby_stations.empty
-        else 0,
-        "predicted_passes_count": len(predicted_passes),
-        "nearest_station": nearby_stations.iloc[0]["name"]
-        if not nearby_stations.empty
-        else "None",
-        "nearest_distance_km": round(
-            nearby_stations.iloc[0]["distance_km"], 1
-        )
-        if not nearby_stations.empty
-        else None,
+        "current_nearby_count": len(nearby_df),
+        "critical_count": (
+            len(nearby_df[nearby_df["alert_level"] == "CRITICAL"])
+            if not nearby_df.empty else 0
+        ),
+        "warning_count": (
+            len(nearby_df[nearby_df["alert_level"] == "WARNING"])
+            if not nearby_df.empty else 0
+        ),
+        "predicted_passes_count": len(passes_df),
+        "spacecraft_with_alerts": (
+            nearby_df["spacecraft"].nunique()
+            if not nearby_df.empty and "spacecraft" in nearby_df.columns
+            else 0
+        ),
     }

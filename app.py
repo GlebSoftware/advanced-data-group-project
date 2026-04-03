@@ -2,40 +2,32 @@
 ISS Tracking and Pass Prediction Dashboard
 
 Real-time analytics pipeline that tracks the International Space Station
-and visualizes proximity to SatNOGS ground stations for potential
-radio frequency interference prediction.
+and other NASA spacecraft, visualizing proximity to SatNOGS ground stations
+for potential radio frequency interference prediction.
 
 MIST6380 - Gleb Alikhver, Lucy Moon, Lexie-Anne Rodkey
 """
 
 import time
-from pathlib import Path
 
 import pandas as pd
-import pydeck as pdk
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.capture import fetch_ground_stations, fetch_iss_position
-from src.process import (
-    append_position_to_history,
-    build_trajectory_dataframe,
-    load_positions_from_csv,
-    process_iss_position,
-    save_positions_to_csv,
-)
+from src.capture import fetch_all_spacecraft, fetch_ground_stations
+from src.process import build_trajectory_dataframe, process_position
 from src.analyze import (
-    find_nearby_stations,
+    find_all_spacecraft_nearby,
     generate_interference_summary,
     predict_upcoming_passes,
 )
 from src.config import (
+    NASA_SPACECRAFT,
     PROXIMITY_THRESHOLD_KM,
     REFRESH_INTERVAL_SECONDS,
 )
 
-# -- Page configuration --
+# -- Page config --
 st.set_page_config(
     page_title="ISS Tracking Dashboard",
     page_icon="🛰️",
@@ -43,49 +35,185 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DATA_DIR = Path("data")
-HISTORY_FILE = DATA_DIR / "iss_history.csv"
+# Build a color lookup from config
+SPACECRAFT_COLORS = {name: color for _, name, color in NASA_SPACECRAFT}
 
 
 def init_session_state() -> None:
-    """Initialize Streamlit session state variables."""
-    if "position_history" not in st.session_state:
-        st.session_state.position_history = load_positions_from_csv(
-            HISTORY_FILE
-        )
+    """Initialize session state on first load."""
     if "ground_stations" not in st.session_state:
         st.session_state.ground_stations = None
-    if "last_refresh" not in st.session_state:
-        st.session_state.last_refresh = 0
+    if "spacecraft_data" not in st.session_state:
+        st.session_state.spacecraft_data = {}
 
 
-def load_ground_stations_cached() -> pd.DataFrame:
+def load_ground_stations() -> pd.DataFrame:
     """Load ground stations once and cache in session state."""
     if st.session_state.ground_stations is None:
         with st.spinner("Loading SatNOGS ground stations..."):
             stations = fetch_ground_stations()
-            if stations is not None:
-                st.session_state.ground_stations = stations
-            else:
-                st.session_state.ground_stations = pd.DataFrame()
+            st.session_state.ground_stations = (
+                stations if stations is not None else pd.DataFrame()
+            )
     return st.session_state.ground_stations
 
 
-def render_sidebar(iss_data: dict, summary: dict) -> float:
-    """Render the sidebar with ISS info, controls, and alert summary."""
+def build_globe(
+    spacecraft_data: dict,
+    stations_df: pd.DataFrame,
+    nearby_df: pd.DataFrame,
+    center_on: str = "ISS",
+) -> go.Figure:
+    """Build the Plotly globe with spacecraft, trajectories, and stations."""
+    fig = go.Figure()
+
+    # -- Ground stations (blue dots) --
+    if not stations_df.empty:
+        # Separate normal vs alerted stations
+        alerted_ids = set()
+        if not nearby_df.empty and "station_id" in nearby_df.columns:
+            alerted_ids = set(nearby_df["station_id"].tolist())
+
+        normal = stations_df[~stations_df["station_id"].isin(alerted_ids)]
+        alerted = stations_df[stations_df["station_id"].isin(alerted_ids)]
+
+        if not normal.empty:
+            fig.add_trace(go.Scattergeo(
+                lat=normal["latitude"],
+                lon=normal["longitude"],
+                mode="markers",
+                marker=dict(size=3, color="#1E90FF", opacity=0.5),
+                name="Ground Stations",
+                hovertext=normal["name"],
+                hoverinfo="text",
+            ))
+
+        if not alerted.empty:
+            fig.add_trace(go.Scattergeo(
+                lat=alerted["latitude"],
+                lon=alerted["longitude"],
+                mode="markers",
+                marker=dict(
+                    size=7,
+                    color="#FFD700",
+                    opacity=0.9,
+                    symbol="diamond",
+                ),
+                name="Alerted Stations",
+                hovertext=alerted["name"],
+                hoverinfo="text",
+            ))
+
+    # -- Spacecraft trajectories and markers --
+    center_lat, center_lon = 0, 0
+
+    for sc_name, positions in spacecraft_data.items():
+        if not positions:
+            continue
+
+        color = SPACECRAFT_COLORS.get(sc_name, "#FFFFFF")
+        latest = positions[-1]
+
+        if sc_name == center_on:
+            center_lat = latest["latitude"]
+            center_lon = latest["longitude"]
+
+        # Trajectory line
+        if len(positions) > 1:
+            traj_df = build_trajectory_dataframe(positions)
+            fig.add_trace(go.Scattergeo(
+                lat=traj_df["latitude"],
+                lon=traj_df["longitude"],
+                mode="lines",
+                line=dict(color=color, width=2),
+                name=f"{sc_name} path",
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+
+        # Current position marker
+        fig.add_trace(go.Scattergeo(
+            lat=[latest["latitude"]],
+            lon=[latest["longitude"]],
+            mode="markers+text",
+            marker=dict(size=10, color=color, symbol="star"),
+            text=[sc_name],
+            textposition="top right",
+            textfont=dict(color=color, size=10),
+            name=sc_name,
+            hovertext=(
+                f"{sc_name}<br>"
+                f"Lat: {latest['latitude']:.2f}<br>"
+                f"Lon: {latest['longitude']:.2f}<br>"
+                f"Alt: {latest['altitude']:.0f} km"
+            ),
+            hoverinfo="text",
+        ))
+
+    # -- Globe styling --
+    fig.update_geos(
+        projection_type="orthographic",
+        projection_rotation=dict(lon=center_lon, lat=center_lat),
+        showocean=True,
+        oceancolor="rgb(0, 40, 100)",
+        showland=True,
+        landcolor="rgb(25, 70, 35)",
+        showcountries=True,
+        countrycolor="rgba(150, 150, 150, 0.4)",
+        showlakes=True,
+        lakecolor="rgb(0, 40, 100)",
+        showrivers=False,
+        bgcolor="rgba(0,0,0,0)",
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=620,
+        margin=dict(l=0, r=0, t=0, b=0),
+        legend=dict(
+            x=0.01, y=0.99,
+            bgcolor="rgba(0,0,0,0.5)",
+            font=dict(size=11),
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+
+    return fig
+
+
+def render_sidebar(
+    spacecraft_data: dict, summary: dict
+) -> tuple[float, bool, str]:
+    """Render sidebar with spacecraft info, controls, and alerts."""
     st.sidebar.title("ISS Tracker")
     st.sidebar.markdown("---")
 
-    # ISS current info
-    st.sidebar.subheader("Current ISS Position")
-    if iss_data:
-        st.sidebar.metric("Latitude", f"{iss_data['latitude']:.4f}")
-        st.sidebar.metric("Longitude", f"{iss_data['longitude']:.4f}")
-        st.sidebar.metric("Altitude", f"{iss_data['altitude']:.1f} km")
-        st.sidebar.metric("Speed", f"{iss_data['speed_kmh']:.0f} km/h")
-        st.sidebar.text(f"Updated: {iss_data['datetime_utc']}")
-    else:
-        st.sidebar.warning("Unable to fetch ISS position")
+    # Show ISS info prominently if available
+    iss_positions = spacecraft_data.get("ISS", [])
+    if iss_positions:
+        iss = process_position(iss_positions[-1])
+        st.sidebar.subheader("ISS Position")
+        c1, c2 = st.sidebar.columns(2)
+        c1.metric("Lat", f"{iss['latitude']:.2f}")
+        c2.metric("Lon", f"{iss['longitude']:.2f}")
+        c1.metric("Alt", f"{iss['altitude']:.0f} km")
+        c2.metric("Speed", f"{iss['speed_kmh']:,.0f}")
+        st.sidebar.caption(f"Updated: {iss['datetime_utc']}")
+
+    st.sidebar.markdown("---")
+
+    # Active spacecraft count
+    st.sidebar.subheader("Tracking")
+    st.sidebar.metric(
+        "Active Spacecraft", len(spacecraft_data)
+    )
+    for name in spacecraft_data:
+        color = SPACECRAFT_COLORS.get(name, "#FFF")
+        st.sidebar.markdown(
+            f"<span style='color:{color}'>&#9733;</span> {name}",
+            unsafe_allow_html=True,
+        )
 
     st.sidebar.markdown("---")
 
@@ -100,294 +228,178 @@ def render_sidebar(iss_data: dict, summary: dict) -> float:
     )
     auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
 
+    # Globe center selection
+    sc_names = list(spacecraft_data.keys())
+    center_on = st.sidebar.selectbox(
+        "Center globe on",
+        sc_names if sc_names else ["ISS"],
+    )
+
     st.sidebar.markdown("---")
 
     # Alert summary
-    st.sidebar.subheader("Alert Summary")
-    if summary:
-        col1, col2 = st.sidebar.columns(2)
-        col1.metric("Nearby Stations", summary["current_nearby_count"])
-        col2.metric("Predicted Passes", summary["predicted_passes_count"])
-
+    st.sidebar.subheader("Alerts")
+    if summary["current_nearby_count"] > 0:
         if summary["critical_count"] > 0:
             st.sidebar.error(
-                f"{summary['critical_count']} CRITICAL proximity alert(s)"
+                f"{summary['critical_count']} CRITICAL alerts"
             )
         if summary["warning_count"] > 0:
             st.sidebar.warning(
-                f"{summary['warning_count']} WARNING proximity alert(s)"
+                f"{summary['warning_count']} WARNING alerts"
             )
-        if summary["nearest_station"] != "None":
-            st.sidebar.info(
-                f"Nearest: {summary['nearest_station']} "
-                f"({summary['nearest_distance_km']} km)"
-            )
-
-    if auto_refresh:
-        st.sidebar.caption(
-            f"Refreshing every {REFRESH_INTERVAL_SECONDS}s"
+        st.sidebar.metric(
+            "Stations in range", summary["current_nearby_count"]
         )
-
-    return threshold
-
-
-def build_map_layer_iss(iss_data: dict) -> pdk.Layer:
-    """Create the pydeck layer for the ISS marker."""
-    return pdk.Layer(
-        "ScatterplotLayer",
-        data=pd.DataFrame(
-            [
-                {
-                    "lat": iss_data["latitude"],
-                    "lon": iss_data["longitude"],
-                    "name": "ISS",
-                }
-            ]
-        ),
-        get_position=["lon", "lat"],
-        get_radius=80000,
-        get_fill_color=[255, 0, 0, 200],
-        pickable=True,
-    )
-
-
-def build_map_layer_trajectory(trajectory_df: pd.DataFrame) -> pdk.Layer:
-    """Create the pydeck layer for the ISS trajectory trail."""
-    if trajectory_df.empty or len(trajectory_df) < 2:
-        return None
-
-    path_data = [
-        {
-            "path": [
-                [row["longitude"], row["latitude"]]
-                for _, row in trajectory_df.iterrows()
-            ],
-            "name": "ISS Trajectory",
-        }
-    ]
-
-    return pdk.Layer(
-        "PathLayer",
-        data=path_data,
-        get_path="path",
-        get_color=[255, 100, 100, 150],
-        width_min_pixels=2,
-        pickable=True,
-    )
-
-
-def build_map_layer_stations(
-    stations_df: pd.DataFrame,
-    nearby_df: pd.DataFrame,
-) -> list[pdk.Layer]:
-    """Create pydeck layers for ground stations (normal + alerted)."""
-    layers = []
-
-    if stations_df.empty:
-        return layers
-
-    # IDs of nearby stations for highlighting
-    nearby_ids = set()
-    if not nearby_df.empty and "station_id" in nearby_df.columns:
-        nearby_ids = set(nearby_df["station_id"].tolist())
-
-    # Normal stations (blue)
-    normal = stations_df[
-        ~stations_df["station_id"].isin(nearby_ids)
-    ].copy()
-    if not normal.empty:
-        layers.append(
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=normal,
-                get_position=["longitude", "latitude"],
-                get_radius=30000,
-                get_fill_color=[30, 144, 255, 140],
-                pickable=True,
-            )
+        st.sidebar.metric(
+            "Predicted passes", summary["predicted_passes_count"]
         )
+    else:
+        st.sidebar.success("No proximity alerts")
 
-    # Nearby stations (yellow/red based on alert level)
-    if not nearby_df.empty:
-        alert_colors = {
-            "CRITICAL": [255, 0, 0, 220],
-            "WARNING": [255, 165, 0, 200],
-            "WATCH": [255, 255, 0, 180],
-        }
-        for level, color in alert_colors.items():
-            level_df = nearby_df[nearby_df["alert_level"] == level]
-            if not level_df.empty:
-                layers.append(
-                    pdk.Layer(
-                        "ScatterplotLayer",
-                        data=level_df,
-                        get_position=["longitude", "latitude"],
-                        get_radius=50000,
-                        get_fill_color=color,
-                        pickable=True,
-                    )
-                )
-
-    return layers
+    return threshold, auto_refresh, center_on
 
 
-def render_map(
-    iss_data: dict,
-    trajectory_df: pd.DataFrame,
-    stations_df: pd.DataFrame,
-    nearby_df: pd.DataFrame,
-) -> None:
-    """Render the main world map with all layers."""
-    layers = []
-
-    # ISS marker
-    layers.append(build_map_layer_iss(iss_data))
-
-    # Trajectory trail
-    traj_layer = build_map_layer_trajectory(trajectory_df)
-    if traj_layer:
-        layers.append(traj_layer)
-
-    # Ground stations
-    layers.extend(build_map_layer_stations(stations_df, nearby_df))
-
-    view_state = pdk.ViewState(
-        latitude=iss_data["latitude"],
-        longitude=iss_data["longitude"],
-        zoom=1.5,
-        pitch=0,
-    )
-
-    deck = pdk.Deck(
-        layers=layers,
-        initial_view_state=view_state,
-        map_style="mapbox://styles/mapbox/dark-v11",
-        tooltip={"text": "{name}"},
-    )
-
-    st.pydeck_chart(deck, use_container_width=True)
-
-
-def render_proximity_alerts(nearby_df: pd.DataFrame) -> None:
-    """Render the proximity alerts table."""
+def render_alerts_table(nearby_df: pd.DataFrame) -> None:
+    """Render the current proximity alerts table."""
     st.subheader("Current Proximity Alerts")
 
     if nearby_df.empty:
         st.success("No ground stations within proximity threshold.")
         return
 
-    display_cols = ["name", "distance_km", "alert_level"]
-    available = [c for c in display_cols if c in nearby_df.columns]
-    display_df = nearby_df[available].copy()
-
-    if "distance_km" in display_df.columns:
-        display_df["distance_km"] = display_df["distance_km"].round(1)
-
-    column_config = {
-        "name": st.column_config.TextColumn("Station Name"),
-        "distance_km": st.column_config.NumberColumn(
-            "Distance (km)", format="%.1f"
-        ),
-        "alert_level": st.column_config.TextColumn("Alert Level"),
-    }
-
-    st.dataframe(
-        display_df,
-        column_config=column_config,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-def render_predicted_passes(passes_df: pd.DataFrame) -> None:
-    """Render the predicted passes table."""
-    st.subheader("Predicted Upcoming Passes (Next 90 Minutes)")
-
-    if passes_df.empty:
-        st.info("No predicted passes within the threshold window.")
-        return
-
     display_cols = [
-        "station_name",
-        "estimated_distance_km",
-        "projected_time_utc",
-        "alert_level",
+        c for c in ["spacecraft", "name", "distance_km", "alert_level"]
+        if c in nearby_df.columns
     ]
-    available = [c for c in display_cols if c in passes_df.columns]
+    display = nearby_df[display_cols].copy()
+    if "distance_km" in display.columns:
+        display["distance_km"] = display["distance_km"].round(1)
 
     st.dataframe(
-        passes_df[available],
+        display,
         column_config={
-            "station_name": "Station",
-            "estimated_distance_km": st.column_config.NumberColumn(
-                "Est. Distance (km)", format="%.1f"
+            "spacecraft": "Spacecraft",
+            "name": "Station",
+            "distance_km": st.column_config.NumberColumn(
+                "Distance (km)", format="%.1f"
             ),
-            "projected_time_utc": "Projected Time (UTC)",
-            "alert_level": "Alert Level",
+            "alert_level": "Alert",
         },
         use_container_width=True,
         hide_index=True,
     )
 
 
-def render_speed_chart(trajectory_df: pd.DataFrame) -> None:
-    """Render the speed over time chart."""
-    st.subheader("ISS Speed Over Time")
+def render_passes_table(passes_df: pd.DataFrame) -> None:
+    """Render predicted passes table."""
+    st.subheader("Predicted Passes (Next 90 Min)")
 
-    if trajectory_df.empty or "velocity" not in trajectory_df.columns:
-        st.info("Collecting speed data... refresh to accumulate points.")
+    if passes_df.empty:
+        st.info("No predicted passes within threshold.")
         return
 
-    if len(trajectory_df) < 2:
-        st.info("Need at least 2 data points for speed chart.")
-        return
+    display_cols = [
+        c for c in [
+            "spacecraft", "station_name",
+            "estimated_distance_km", "projected_time_utc", "alert_level"
+        ]
+        if c in passes_df.columns
+    ]
 
-    df = trajectory_df.copy()
-    df["time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-
-    fig = px.line(
-        df,
-        x="time",
-        y="velocity",
-        labels={"time": "Time (UTC)", "velocity": "Speed (km/h)"},
+    st.dataframe(
+        passes_df[display_cols].head(20),
+        column_config={
+            "spacecraft": "Spacecraft",
+            "station_name": "Station",
+            "estimated_distance_km": st.column_config.NumberColumn(
+                "Est. Distance (km)", format="%.1f"
+            ),
+            "projected_time_utc": "Time (UTC)",
+            "alert_level": "Alert",
+        },
+        use_container_width=True,
+        hide_index=True,
     )
+
+
+def render_speed_chart(spacecraft_data: dict) -> None:
+    """Render speed over time for all tracked spacecraft."""
+    st.subheader("Spacecraft Speed Over Time")
+
+    fig = go.Figure()
+    has_data = False
+
+    for sc_name, positions in spacecraft_data.items():
+        if len(positions) < 2:
+            continue
+        df = build_trajectory_dataframe(positions)
+        if "velocity" not in df.columns or df["velocity"].sum() == 0:
+            continue
+        df = df[df["velocity"] > 0]
+        if df.empty:
+            continue
+
+        has_data = True
+        df["time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        color = SPACECRAFT_COLORS.get(sc_name, "#FFFFFF")
+        fig.add_trace(go.Scatter(
+            x=df["time"], y=df["velocity"],
+            mode="lines",
+            name=sc_name,
+            line=dict(color=color, width=2),
+        ))
+
+    if not has_data:
+        st.info("Collecting speed data across refreshes...")
+        return
+
     fig.update_layout(
         template="plotly_dark",
         height=300,
         margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title="Time (UTC)",
+        yaxis_title="Speed (km/h)",
+        legend=dict(x=0, y=1),
     )
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_altitude_chart(trajectory_df: pd.DataFrame) -> None:
-    """Render the altitude over time chart."""
-    st.subheader("ISS Altitude Over Time")
+def render_altitude_chart(spacecraft_data: dict) -> None:
+    """Render altitude over time for all tracked spacecraft."""
+    st.subheader("Spacecraft Altitude Over Time")
 
-    if trajectory_df.empty or "altitude" not in trajectory_df.columns:
+    fig = go.Figure()
+    has_data = False
+
+    for sc_name, positions in spacecraft_data.items():
+        if len(positions) < 2:
+            continue
+        df = build_trajectory_dataframe(positions)
+        if "altitude" not in df.columns:
+            continue
+
+        has_data = True
+        df["time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        color = SPACECRAFT_COLORS.get(sc_name, "#FFFFFF")
+        fig.add_trace(go.Scatter(
+            x=df["time"], y=df["altitude"],
+            mode="lines",
+            name=sc_name,
+            line=dict(color=color, width=2),
+        ))
+
+    if not has_data:
         st.info("Collecting altitude data...")
         return
 
-    if len(trajectory_df) < 2:
-        st.info("Need at least 2 data points for altitude chart.")
-        return
-
-    df = trajectory_df.copy()
-    df["time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-
-    fig = px.area(
-        df,
-        x="time",
-        y="altitude",
-        labels={"time": "Time (UTC)", "altitude": "Altitude (km)"},
-    )
     fig.update_layout(
         template="plotly_dark",
         height=300,
         margin=dict(l=0, r=0, t=10, b=0),
-    )
-    fig.update_traces(
-        line_color="#1E90FF",
-        fillcolor="rgba(30,144,255,0.2)",
+        xaxis_title="Time (UTC)",
+        yaxis_title="Altitude (km)",
+        legend=dict(x=0, y=1),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -396,32 +408,18 @@ def main() -> None:
     """Main dashboard entry point."""
     init_session_state()
 
-    # -- Fetch data --
-    raw_position = fetch_iss_position()
+    # -- Fetch all data --
+    with st.spinner("Fetching spacecraft positions from NASA..."):
+        spacecraft_data = fetch_all_spacecraft()
 
-    if raw_position is None:
+    if not spacecraft_data:
         st.error(
-            "Could not connect to the ISS tracking API. "
-            "Please check your internet connection and try again."
+            "Could not connect to spacecraft tracking APIs. "
+            "Check your internet connection and try again."
         )
         return
 
-    iss_data = process_iss_position(raw_position)
-
-    # Update position history
-    st.session_state.position_history = append_position_to_history(
-        st.session_state.position_history, raw_position
-    )
-    save_positions_to_csv(
-        st.session_state.position_history, HISTORY_FILE
-    )
-
-    trajectory_df = build_trajectory_dataframe(
-        st.session_state.position_history
-    )
-
-    # Load ground stations
-    stations_df = load_ground_stations_cached()
+    stations_df = load_ground_stations()
 
     # -- Analysis --
     nearby_df = pd.DataFrame()
@@ -431,82 +429,108 @@ def main() -> None:
         "critical_count": 0,
         "warning_count": 0,
         "predicted_passes_count": 0,
-        "nearest_station": "None",
-        "nearest_distance_km": None,
+        "spacecraft_with_alerts": 0,
     }
 
-    threshold = render_sidebar(iss_data, summary)
-
-    if not stations_df.empty:
-        nearby_df = find_nearby_stations(
-            iss_data["latitude"],
-            iss_data["longitude"],
-            stations_df,
-            threshold_km=threshold,
-        )
-        passes_df = predict_upcoming_passes(
-            trajectory_df, stations_df, threshold_km=threshold
-        )
-        summary = generate_interference_summary(nearby_df, passes_df)
-
-    # -- Dashboard layout --
-    st.title("Real-Time ISS Tracking & Pass Prediction Dashboard")
-    st.caption(
-        "Tracking the International Space Station and predicting "
-        "ground station proximity for RF interference analysis"
+    # Sidebar (renders controls, returns user selections)
+    threshold, auto_refresh, center_on = render_sidebar(
+        spacecraft_data, summary
     )
 
-    # Map
-    render_map(iss_data, trajectory_df, stations_df, nearby_df)
+    # Run analysis with user-selected threshold
+    if not stations_df.empty:
+        nearby_df = find_all_spacecraft_nearby(
+            spacecraft_data, stations_df, threshold_km=threshold
+        )
 
-    # Alerts and predictions side by side
+        # Predict passes for each spacecraft
+        all_passes = []
+        for sc_name, positions in spacecraft_data.items():
+            traj_df = build_trajectory_dataframe(positions)
+            sc_passes = predict_upcoming_passes(
+                traj_df, stations_df, sc_name, threshold_km=threshold
+            )
+            if not sc_passes.empty:
+                all_passes.append(sc_passes)
+
+        passes_df = (
+            pd.concat(all_passes, ignore_index=True)
+            if all_passes else pd.DataFrame()
+        )
+
+        summary = generate_interference_summary(nearby_df, passes_df)
+
+    # -- Layout --
+    st.title("Real-Time ISS Tracking & Pass Prediction Dashboard")
+    st.caption(
+        "Tracking NASA spacecraft and predicting ground station "
+        "proximity for RF interference analysis"
+    )
+
+    # Globe map
+    fig = build_globe(
+        spacecraft_data, stations_df, nearby_df, center_on=center_on
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Alerts and predictions
     col1, col2 = st.columns(2)
     with col1:
-        render_proximity_alerts(nearby_df)
+        render_alerts_table(nearby_df)
     with col2:
-        render_predicted_passes(passes_df)
+        render_passes_table(passes_df)
 
-    # Charts side by side
+    # Charts
     col3, col4 = st.columns(2)
     with col3:
-        render_speed_chart(trajectory_df)
+        render_speed_chart(spacecraft_data)
     with col4:
-        render_altitude_chart(trajectory_df)
+        render_altitude_chart(spacecraft_data)
 
-    # Pipeline info expander
+    # Pipeline info
     with st.expander("About This Pipeline"):
         st.markdown(
             """
 **Data Pipeline Stages:**
 
-1. **Capture** -- Live ISS position data from the Where the ISS At
-   API; ground station locations from the SatNOGS Network API.
-2. **Process** -- Timestamps converted to UTC, coordinate data
-   structured into DataFrames, speed and trajectory features
-   engineered.
-3. **Store** -- Position history persisted to CSV; ground station
-   data cached in session state.
-4. **Analyze** -- Haversine distance computed between ISS and each
-   ground station. Stations within the proximity threshold are
-   flagged. Trajectory projection estimates upcoming passes.
-5. **Communicate** -- This interactive Streamlit dashboard
-   visualizes all pipeline outputs in real time.
+1. **Capture** -- Real-time ISS position from the Where the ISS At
+   API. Orbital data for additional NASA spacecraft (Aqua, Aura,
+   Landsat 8/9, NOAA-20, Suomi NPP) from the NASA Satellite
+   Situation Center (SSC) API. Ground station locations from the
+   SatNOGS Network API.
+
+2. **Process** -- Raw GEO cartesian coordinates (X, Y, Z in km)
+   converted to geographic latitude, longitude, and altitude using
+   trigonometric transformations. Timestamps parsed and
+   standardized to UTC. Speed estimated from sequential positions.
+
+3. **Store** -- Ground station data cached in session state.
+   Spacecraft position histories maintained in memory across
+   dashboard refreshes.
+
+4. **Analyze** -- Haversine distance computed between every
+   spacecraft and every ground station. Stations within the
+   proximity threshold flagged with CRITICAL/WARNING/WATCH
+   severity. Trajectory projection predicts upcoming passes
+   over the next 90 minutes.
+
+5. **Communicate** -- This interactive Streamlit dashboard with
+   a 3D globe, proximity alerts, pass predictions, and
+   speed/altitude charts.
 
 **Data Sources:**
 - [Where the ISS At API](https://wheretheiss.at/w/developer)
+  -- real-time ISS tracking (no API key required)
+- [NASA Satellite Situation Center](https://sscweb.gsfc.nasa.gov/)
+  -- orbital data for NASA spacecraft (no API key required)
 - [SatNOGS Network API](https://network.satnogs.org/api/)
+  -- global ground station locations (no API key required)
 
-**Authors:** Gleb Alikhver, Lucy Moon, Lexie-Anne Rodkey
--- MIST6380
+**Authors:** Gleb Alikhver, Lucy Moon, Lexie-Anne Rodkey -- MIST6380
             """
         )
 
     # Auto-refresh
-    auto_refresh = st.sidebar.checkbox(
-        "Auto-refresh enabled",
-        value=True,
-        key="auto_refresh_toggle",
-    )
     if auto_refresh:
         time.sleep(REFRESH_INTERVAL_SECONDS)
         st.rerun()

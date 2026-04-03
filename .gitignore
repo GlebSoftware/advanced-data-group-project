@@ -44,6 +44,7 @@ data/*.csv
 .streamlit/secrets.toml
 
 # Testing
+tests/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -56,3 +57,6 @@ htmlcov/
 .claude/
 CLAUDE.md
 learning/
+
+# Playwright
+.playwright-mcp/
