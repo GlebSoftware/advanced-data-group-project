@@ -8,11 +8,12 @@ for potential radio frequency interference prediction.
 MIST6380 - Gleb Alikhver, Lucy Moon, Lexie-Anne Rodkey
 """
 
-import time
+from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from src.capture import (
     fetch_all_spacecraft,
@@ -21,10 +22,7 @@ from src.capture import (
 )
 from src.process import build_trajectory_dataframe, process_position
 from src.analyze import (
-    find_all_spacecraft_nearby,
     predict_passes_over_location,
-    generate_interference_summary,
-    predict_upcoming_passes,
 )
 from src.config import (
     NASA_SPACECRAFT,
@@ -42,6 +40,19 @@ st.set_page_config(
 
 # Build a color lookup from config
 SPACECRAFT_COLORS = {name: color for _, name, color in NASA_SPACECRAFT}
+
+# Eastern Time offset (UTC-4 for EDT, UTC-5 for EST)
+ET_OFFSET = timedelta(hours=-4)
+ET_TZ = timezone(ET_OFFSET)
+
+# Athens, GA coordinates
+ATHENS_GA = {"latitude": 33.9519, "longitude": -83.3576}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_spacecraft_cached() -> dict:
+    """Fetch spacecraft positions with 30s cache to avoid API calls on every rerun."""
+    return fetch_all_spacecraft()
 
 
 def init_session_state() -> None:
@@ -63,65 +74,56 @@ def load_ground_stations() -> pd.DataFrame:
     return st.session_state.ground_stations
 
 
+def filter_spacecraft_by_altitude(
+    spacecraft_data: dict,
+    alt_range: tuple[float, float],
+) -> dict:
+    """Filter spacecraft to only those orbiting within the altitude range."""
+    min_alt, max_alt = alt_range
+    filtered = {}
+    for sc_name, positions in spacecraft_data.items():
+        if not positions:
+            continue
+        latest = positions[-1]
+        if min_alt <= latest["altitude"] <= max_alt:
+            filtered[sc_name] = positions
+    return filtered
+
+
+def to_eastern(utc_dt: datetime) -> str:
+    """Convert a UTC datetime to Eastern Time string."""
+    eastern = utc_dt.astimezone(ET_TZ)
+    return eastern.strftime("%I:%M:%S %p ET")
+
+
 def build_globe(
     spacecraft_data: dict,
     stations_df: pd.DataFrame,
-    nearby_df: pd.DataFrame,
-    center_on: str = "ISS",
+    center_lat: float,
+    center_lon: float,
 ) -> go.Figure:
     """Build the Plotly globe with spacecraft, trajectories, and stations."""
     fig = go.Figure()
 
     # -- Ground stations (blue dots) --
     if not stations_df.empty:
-        # Separate normal vs alerted stations
-        alerted_ids = set()
-        if not nearby_df.empty and "station_id" in nearby_df.columns:
-            alerted_ids = set(nearby_df["station_id"].tolist())
-
-        normal = stations_df[~stations_df["station_id"].isin(alerted_ids)]
-        alerted = stations_df[stations_df["station_id"].isin(alerted_ids)]
-
-        if not normal.empty:
-            fig.add_trace(go.Scattergeo(
-                lat=normal["latitude"],
-                lon=normal["longitude"],
-                mode="markers",
-                marker=dict(size=3, color="#1E90FF", opacity=0.5),
-                name="Ground Stations",
-                hovertext=normal["name"],
-                hoverinfo="text",
-            ))
-
-        if not alerted.empty:
-            fig.add_trace(go.Scattergeo(
-                lat=alerted["latitude"],
-                lon=alerted["longitude"],
-                mode="markers",
-                marker=dict(
-                    size=7,
-                    color="#FFD700",
-                    opacity=0.9,
-                    symbol="diamond",
-                ),
-                name="Alerted Stations",
-                hovertext=alerted["name"],
-                hoverinfo="text",
-            ))
+        fig.add_trace(go.Scattergeo(
+            lat=stations_df["latitude"],
+            lon=stations_df["longitude"],
+            mode="markers",
+            marker=dict(size=3, color="#1E90FF", opacity=0.5),
+            name="Ground Stations",
+            hovertext=stations_df["name"],
+            hoverinfo="text",
+        ))
 
     # -- Spacecraft trajectories and markers --
-    center_lat, center_lon = 0, 0
-
     for sc_name, positions in spacecraft_data.items():
         if not positions:
             continue
 
         color = SPACECRAFT_COLORS.get(sc_name, "#FFFFFF")
         latest = positions[-1]
-
-        if sc_name == center_on:
-            center_lat = latest["latitude"]
-            center_lon = latest["longitude"]
 
         # Trajectory line
         if len(positions) > 1:
@@ -182,19 +184,30 @@ def build_globe(
         ),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
+        uirevision="globe",
     )
 
     return fig
 
 
-def render_sidebar(
-    spacecraft_data: dict, summary: dict
-) -> tuple[float, bool, str]:
-    """Render sidebar with spacecraft info, controls, and alerts."""
+def render_sidebar_controls() -> None:
+    """Render sidebar controls. Widget values stored in session state."""
     st.sidebar.title("ISS Tracker")
     st.sidebar.markdown("---")
+    st.sidebar.subheader("Controls")
+    st.sidebar.slider(
+        "Altitude range (km)",
+        min_value=400,
+        max_value=900,
+        value=(400, 900),
+        step=50,
+        key="alt_threshold",
+        help="Show only spacecraft orbiting within this altitude range",
+    )
 
-    # Show ISS info prominently if available
+
+def render_sidebar_data(spacecraft_data: dict) -> None:
+    """Render sidebar data: ISS position and tracked spacecraft list."""
     iss_positions = spacecraft_data.get("ISS", [])
     if iss_positions:
         iss = process_position(iss_positions[-1])
@@ -204,128 +217,21 @@ def render_sidebar(
         c2.metric("Lon", f"{iss['longitude']:.2f}")
         c1.metric("Alt", f"{iss['altitude']:.0f} km")
         c2.metric("Speed", f"{iss['speed_kmh']:,.0f}")
-        st.sidebar.caption(f"Updated: {iss['datetime_utc']}")
+        utc_dt = datetime.fromtimestamp(
+            iss_positions[-1]["timestamp"], tz=timezone.utc
+        )
+        st.sidebar.caption(f"Updated: {to_eastern(utc_dt)}")
 
     st.sidebar.markdown("---")
 
-    # Active spacecraft count
     st.sidebar.subheader("Tracking")
-    st.sidebar.metric(
-        "Active Spacecraft", len(spacecraft_data)
-    )
+    st.sidebar.metric("Visible Spacecraft", len(spacecraft_data))
     for name in spacecraft_data:
         color = SPACECRAFT_COLORS.get(name, "#FFF")
         st.sidebar.markdown(
             f"<span style='color:{color}'>&#9733;</span> {name}",
             unsafe_allow_html=True,
         )
-
-    st.sidebar.markdown("---")
-
-    # Controls
-    st.sidebar.subheader("Controls")
-    threshold = st.sidebar.slider(
-        "Proximity threshold (km)",
-        min_value=100,
-        max_value=2000,
-        value=PROXIMITY_THRESHOLD_KM,
-        step=50,
-    )
-    auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
-
-    # Globe center selection
-    sc_names = list(spacecraft_data.keys())
-    center_on = st.sidebar.selectbox(
-        "Center globe on",
-        sc_names if sc_names else ["ISS"],
-    )
-
-    st.sidebar.markdown("---")
-
-    # Alert summary
-    st.sidebar.subheader("Alerts")
-    if summary["current_nearby_count"] > 0:
-        if summary["critical_count"] > 0:
-            st.sidebar.error(
-                f"{summary['critical_count']} CRITICAL alerts"
-            )
-        if summary["warning_count"] > 0:
-            st.sidebar.warning(
-                f"{summary['warning_count']} WARNING alerts"
-            )
-        st.sidebar.metric(
-            "Stations in range", summary["current_nearby_count"]
-        )
-        st.sidebar.metric(
-            "Predicted passes", summary["predicted_passes_count"]
-        )
-    else:
-        st.sidebar.success("No proximity alerts")
-
-    return threshold, auto_refresh, center_on
-
-
-def render_alerts_table(nearby_df: pd.DataFrame) -> None:
-    """Render the current proximity alerts table."""
-    st.subheader("Current Proximity Alerts")
-
-    if nearby_df.empty:
-        st.success("No ground stations within proximity threshold.")
-        return
-
-    display_cols = [
-        c for c in ["spacecraft", "name", "distance_km", "alert_level"]
-        if c in nearby_df.columns
-    ]
-    display = nearby_df[display_cols].copy()
-    if "distance_km" in display.columns:
-        display["distance_km"] = display["distance_km"].round(1)
-
-    st.dataframe(
-        display,
-        column_config={
-            "spacecraft": "Spacecraft",
-            "name": "Station",
-            "distance_km": st.column_config.NumberColumn(
-                "Distance (km)", format="%.1f"
-            ),
-            "alert_level": "Alert",
-        },
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-def render_passes_table(passes_df: pd.DataFrame) -> None:
-    """Render predicted passes table."""
-    st.subheader("Predicted Passes (Next 90 Min)")
-
-    if passes_df.empty:
-        st.info("No predicted passes within threshold.")
-        return
-
-    display_cols = [
-        c for c in [
-            "spacecraft", "station_name",
-            "estimated_distance_km", "projected_time_utc", "alert_level"
-        ]
-        if c in passes_df.columns
-    ]
-
-    st.dataframe(
-        passes_df[display_cols].head(20),
-        column_config={
-            "spacecraft": "Spacecraft",
-            "station_name": "Station",
-            "estimated_distance_km": st.column_config.NumberColumn(
-                "Est. Distance (km)", format="%.1f"
-            ),
-            "projected_time_utc": "Time (UTC)",
-            "alert_level": "Alert",
-        },
-        use_container_width=True,
-        hide_index=True,
-    )
 
 
 def render_speed_chart(spacecraft_data: dict) -> None:
@@ -346,7 +252,9 @@ def render_speed_chart(spacecraft_data: dict) -> None:
             continue
 
         has_data = True
-        df["time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        df["time"] = pd.to_datetime(
+            df["timestamp"], unit="s", utc=True
+        ).dt.tz_convert(ET_TZ)
         color = SPACECRAFT_COLORS.get(sc_name, "#FFFFFF")
         fig.add_trace(go.Scatter(
             x=df["time"], y=df["velocity"],
@@ -363,11 +271,11 @@ def render_speed_chart(spacecraft_data: dict) -> None:
         template="plotly_dark",
         height=300,
         margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title="Time (UTC)",
+        xaxis_title="Time (ET)",
         yaxis_title="Speed (km/h)",
         legend=dict(x=0, y=1),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_altitude_chart(spacecraft_data: dict) -> None:
@@ -385,7 +293,9 @@ def render_altitude_chart(spacecraft_data: dict) -> None:
             continue
 
         has_data = True
-        df["time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        df["time"] = pd.to_datetime(
+            df["timestamp"], unit="s", utc=True
+        ).dt.tz_convert(ET_TZ)
         color = SPACECRAFT_COLORS.get(sc_name, "#FFFFFF")
         fig.add_trace(go.Scatter(
             x=df["time"], y=df["altitude"],
@@ -402,21 +312,51 @@ def render_altitude_chart(spacecraft_data: dict) -> None:
         template="plotly_dark",
         height=300,
         margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title="Time (UTC)",
+        xaxis_title="Time (ET)",
         yaxis_title="Altitude (km)",
         legend=dict(x=0, y=1),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def main() -> None:
     """Main dashboard entry point."""
     init_session_state()
 
-    # -- Fetch all data --
-    with st.spinner("Fetching spacecraft positions from NASA..."):
-        spacecraft_data = fetch_all_spacecraft()
+    # -- Auto-refresh via JS timer --
+    st_autorefresh(
+        interval=REFRESH_INTERVAL_SECONDS * 1000,
+        key="auto_refresh",
+    )
 
+    # -- Suppress rerun dimming --
+    st.markdown(
+        """<style>
+        [data-testid="stStatusWidget"] { display: none !important; }
+        .stApp div, .stApp section, .stApp iframe {
+            opacity: 1 !important;
+            transition: opacity 0s !important;
+        }
+        [data-stale], [data-stale="true"] {
+            opacity: 1 !important;
+        }
+        .element-container {
+            opacity: 1 !important;
+            transition: none !important;
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
+    stations_df = load_ground_stations()
+
+    # -- Sidebar controls --
+    render_sidebar_controls()
+
+    # -- Fetch spacecraft data (cached 30s) --
+    spacecraft_data = _fetch_spacecraft_cached()
+    if not spacecraft_data:
+        spacecraft_data = st.session_state.get("spacecraft_data", {})
     if not spacecraft_data:
         st.error(
             "Could not connect to spacecraft tracking APIs. "
@@ -424,73 +364,53 @@ def main() -> None:
         )
         return
 
-    stations_df = load_ground_stations()
+    st.session_state.spacecraft_data = spacecraft_data
 
-    # -- Analysis --
-    nearby_df = pd.DataFrame()
-    passes_df = pd.DataFrame()
-    summary = {
-        "current_nearby_count": 0,
-        "critical_count": 0,
-        "warning_count": 0,
-        "predicted_passes_count": 0,
-        "spacecraft_with_alerts": 0,
-    }
-
-    # Sidebar (renders controls, returns user selections)
-    threshold, auto_refresh, center_on = render_sidebar(
-        spacecraft_data, summary
+    # -- Center selection (spacecraft + Athens, GA) --
+    sc_names = list(spacecraft_data.keys())
+    center_options = sc_names + ["Athens, GA"]
+    center_on = st.sidebar.selectbox(
+        "Center globe on",
+        center_options,
+        key="center_select",
     )
 
-    # Run analysis with user-selected threshold
-    if not stations_df.empty:
-        nearby_df = find_all_spacecraft_nearby(
-            spacecraft_data, stations_df, threshold_km=threshold
-        )
+    # Resolve center coordinates
+    if center_on == "Athens, GA":
+        center_lat = ATHENS_GA["latitude"]
+        center_lon = ATHENS_GA["longitude"]
+    else:
+        center_positions = spacecraft_data.get(center_on, [])
+        if center_positions:
+            center_lat = center_positions[-1]["latitude"]
+            center_lon = center_positions[-1]["longitude"]
+        else:
+            center_lat, center_lon = 0.0, 0.0
 
-        # Predict passes for each spacecraft
-        all_passes = []
-        for sc_name, positions in spacecraft_data.items():
-            traj_df = build_trajectory_dataframe(positions)
-            sc_passes = predict_upcoming_passes(
-                traj_df, stations_df, sc_name, threshold_km=threshold
-            )
-            if not sc_passes.empty:
-                all_passes.append(sc_passes)
+    # -- Filter spacecraft by altitude --
+    alt_range = st.session_state.get("alt_threshold", (400, 900))
+    visible_data = filter_spacecraft_by_altitude(spacecraft_data, alt_range)
 
-        passes_df = (
-            pd.concat(all_passes, ignore_index=True)
-            if all_passes else pd.DataFrame()
-        )
+    # -- Sidebar data --
+    render_sidebar_data(visible_data)
 
-        summary = generate_interference_summary(nearby_df, passes_df)
-
-    # -- Layout --
+    # -- Page header --
     st.title("Real-Time ISS Tracking & Pass Prediction Dashboard")
     st.caption(
         "Tracking NASA spacecraft and predicting ground station "
         "proximity for RF interference analysis"
     )
 
-    # Globe map
-    fig = build_globe(
-        spacecraft_data, stations_df, nearby_df, center_on=center_on
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Alerts and predictions
-    col1, col2 = st.columns(2)
-    with col1:
-        render_alerts_table(nearby_df)
-    with col2:
-        render_passes_table(passes_df)
+    # -- Globe --
+    fig = build_globe(visible_data, stations_df, center_lat, center_lon)
+    st.plotly_chart(fig, width="stretch", key="globe")
 
     # -- What's Passing Over Me? --
     st.markdown("---")
     st.subheader("What's Passing Over Me?")
     st.caption(
         "Enter a US address to see which spacecraft will pass "
-        "near your location in the next 90 minutes."
+        "within 500 km of your location in the next 90 minutes."
     )
 
     address_input = st.text_input(
@@ -500,8 +420,7 @@ def main() -> None:
     )
 
     if address_input:
-        with st.spinner("Geocoding address..."):
-            location = geocode_address(address_input)
+        location = geocode_address(address_input)
 
         if location is None:
             st.error(
@@ -519,15 +438,14 @@ def main() -> None:
                 location["latitude"],
                 location["longitude"],
                 spacecraft_data,
-                threshold_km=threshold,
+                threshold_km=PROXIMITY_THRESHOLD_KM,
             )
 
             if user_passes.empty:
                 st.info(
                     "No spacecraft predicted to pass within "
-                    f"{threshold} km of your location in the "
-                    "next 90 minutes. Try increasing the "
-                    "proximity threshold in the sidebar."
+                    f"{PROXIMITY_THRESHOLD_KM} km of your location "
+                    "in the next 90 minutes."
                 )
             else:
                 st.dataframe(
@@ -539,24 +457,24 @@ def main() -> None:
                                 "Closest Approach (km)",
                                 format="%.1f",
                             ),
-                        "projected_time_utc": "Estimated Time (UTC)",
+                        "projected_time_et": "Estimated Time (ET)",
                         "minutes_from_now":
                             st.column_config.NumberColumn(
                                 "Minutes From Now",
                             ),
                     },
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
-    # Charts
-    col3, col4 = st.columns(2)
-    with col3:
-        render_speed_chart(spacecraft_data)
-    with col4:
-        render_altitude_chart(spacecraft_data)
+    # -- Charts --
+    col1, col2 = st.columns(2)
+    with col1:
+        render_speed_chart(visible_data)
+    with col2:
+        render_altitude_chart(visible_data)
 
-    # Pipeline info
+    # -- Pipeline info --
     with st.expander("About This Pipeline"):
         st.markdown(
             """
@@ -601,11 +519,6 @@ def main() -> None:
 **Authors:** Gleb Alikhver, Lucy Moon, Lexie-Anne Rodkey -- MIST6380
             """
         )
-
-    # Auto-refresh
-    if auto_refresh:
-        time.sleep(REFRESH_INTERVAL_SECONDS)
-        st.rerun()
 
 
 if __name__ == "__main__":

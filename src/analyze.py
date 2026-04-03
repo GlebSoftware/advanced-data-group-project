@@ -5,7 +5,7 @@ Handles proximity detection between spacecraft and ground stations,
 pass prediction, and interference window identification.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from haversine import haversine, Unit
@@ -210,19 +210,20 @@ def predict_passes_over_location(
                 unit=Unit.KILOMETERS,
             )
             if dist <= threshold_km:
+                et_tz = timezone(timedelta(hours=-4))
                 passes.append({
                     "spacecraft": sc_name,
                     "estimated_distance_km": round(dist, 1),
-                    "projected_time_utc": datetime.fromtimestamp(
+                    "projected_time_et": datetime.fromtimestamp(
                         proj_time, tz=timezone.utc
-                    ).strftime("%Y-%m-%d %H:%M UTC"),
+                    ).astimezone(et_tz).strftime("%Y-%m-%d %I:%M %p ET"),
                     "minutes_from_now": step,
                 })
 
     if not passes:
         return pd.DataFrame(columns=[
             "spacecraft", "estimated_distance_km",
-            "projected_time_utc", "minutes_from_now",
+            "projected_time_et", "minutes_from_now",
         ])
 
     return (

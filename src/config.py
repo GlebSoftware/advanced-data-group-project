@@ -22,10 +22,10 @@ EARTH_RADIUS_KM = 6371.2
 PROXIMITY_THRESHOLD_KM = 500
 
 # Auto-refresh interval in seconds
-REFRESH_INTERVAL_SECONDS = 15
+REFRESH_INTERVAL_SECONDS = 60
 
 # Number of historical positions to retain for trajectory plotting
 TRAJECTORY_HISTORY_SIZE = 100
 
 # Ground station status filter (only include operational stations)
-STATION_STATUS_ACTIVE = 2
+STATION_STATUS_ACTIVE = "Online"

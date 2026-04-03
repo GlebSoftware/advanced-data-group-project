@@ -12,6 +12,7 @@ from typing import Optional
 
 import pandas as pd
 import requests
+from haversine import haversine, Unit
 
 from src.config import (
     ISS_POSITION_URL,
@@ -38,7 +39,7 @@ def fetch_iss_position() -> Optional[dict]:
             "latitude": float(data["latitude"]),
             "longitude": float(data["longitude"]),
             "altitude": float(data["altitude"]),
-            "velocity": float(data["velocity"]),
+            "velocity": 0.0,
             "timestamp": int(data["timestamp"]),
             "visibility": data.get("visibility", "unknown"),
         }
@@ -114,7 +115,6 @@ def fetch_nasa_ssc_positions(
             curr = positions[i]
             dt_hours = (curr["timestamp"] - prev["timestamp"]) / 3600
             if dt_hours > 0:
-                from haversine import haversine, Unit
                 dist = haversine(
                     (prev["latitude"], prev["longitude"]),
                     (curr["latitude"], curr["longitude"]),
@@ -147,7 +147,11 @@ def fetch_all_spacecraft() -> dict:
                 ssc_data = fetch_nasa_ssc_positions("iss", minutes=90)
                 if ssc_data:
                     results[sc_name] = ssc_data
-                    # Update the latest point with real-time data
+                    # Inherit the last SSC point's velocity for consistency.
+                    # Re-estimating via haversine between SSC and real-time
+                    # API positions gives wrong results because the two
+                    # sources use different orbit models.
+                    iss_pos["velocity"] = ssc_data[-1]["velocity"]
                     results[sc_name].append(iss_pos)
         else:
             positions = fetch_nasa_ssc_positions(sc_id, minutes=90)

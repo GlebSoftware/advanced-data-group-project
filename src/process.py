@@ -5,7 +5,7 @@ Handles data cleaning, timestamp conversion, feature engineering,
 and DataFrame structuring for downstream analysis.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -20,9 +20,10 @@ def process_position(raw_position: dict) -> dict:
     and ensures all numeric fields are properly typed.
     """
     processed = raw_position.copy()
+    et_tz = timezone(timedelta(hours=-4))
     processed["datetime_utc"] = datetime.fromtimestamp(
         raw_position["timestamp"], tz=timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ).astimezone(et_tz).strftime("%I:%M:%S %p ET")
     processed["speed_kmh"] = raw_position.get("velocity", 0.0)
     return processed
 
